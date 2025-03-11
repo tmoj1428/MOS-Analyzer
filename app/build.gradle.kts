@@ -72,6 +72,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 //    implementation(libs.chaquo)
+    implementation(libs.jTransforms)
     implementation(libs.onnxruntime)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
