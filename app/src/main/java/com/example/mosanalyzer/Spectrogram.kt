@@ -1,119 +1,85 @@
 package com.example.mosanalyzer
 
-import android.graphics.Bitmap
-import android.graphics.Color
 import org.jtransforms.fft.FloatFFT_1D
 import kotlin.math.*
 
+/** Spectrogram calculation with center-padding and proper mel normalization */
 class Spectrogram(
-    private val fs: Int = 16000,           // Sampling rate
-    private val frameSize: Int = 320,        // frame_size from Python
-    private val nMels: Int = 120             // n_mels from Python
+    private val fs: Int = 16000,
+    private val frameSize: Int = 320,
+    private val nMels: Int = 120
 ) {
-    // In Python, n_fft is frameSize + 1
-    private val nFft = frameSize + 1          // 321
-    private val hopLength = 160               // as in Python
-    private val numFilters = nMels
-
-    // Hann window of length nFft (we use nFft here for FFT computation)
+    private val nFft = frameSize + 1
+    private val hopLength = 160
+    private val numBins = (nFft + 1) / 2
     private val hannWindow = FloatArray(nFft) { i ->
-        0.5f - 0.5f * cos(2.0 * Math.PI * i / nFft).toFloat()
+        0.5f - 0.5f * cos(2.0 * PI * i / (nFft - 1)).toFloat()
     }
-
-    // FFT instance
     private val fft = FloatFFT_1D(nFft.toLong())
-
-    // Instantiate our Mel filterbank using our updated class (see below)
     private val melFilterbank = MelFilterbank(fs.toFloat(), frameSize, nMels)
-
-    // The computed mel spectrogram frames (each is a FloatArray of length nMels)
     val melSpectrogram = mutableListOf<FloatArray>()
 
-    /**
-     * Process a segment of audio. The input segment should already be of fixed length.
-     * In the Python code, each segment is audio_seg[:-160]; that is, the last 160 samples are dropped.
-     */
-    fun processSegment(segment: ShortArray) {
-        // Convert to FloatArray
-        val audioFloat = FloatArray(segment.size) { i -> segment[i].toFloat() }
-        // Determine the number of frames using: 1 + floor((len(segment) - nFft) / hopLength)
-        val numFrames = 1 + ((audioFloat.size - nFft) / hopLength)
+    fun processSegment(segment: FloatArray) {
+        val padSize = nFft / 2
+        val paddedSegment = padArray(segment, padSize)
+        val numFrames = 1 + (paddedSegment.size - nFft) / hopLength
+        melSpectrogram.clear()
+
         for (i in 0 until numFrames) {
             val start = i * hopLength
-            // Extract frame of length nFft
-            val frame = FloatArray(nFft) { j -> audioFloat[start + j] }
+            val frame = paddedSegment.copyOfRange(start, start + nFft)
+
             // Apply Hann window
-            for (j in frame.indices) {
-                frame[j] *= hannWindow[j]
-            }
-            // Compute FFT in-place
-            fft.realForward(frame)
-            // Compute power spectrum for the first nFft/2 bins
-            val nBins = nFft / 2  // integer division (321/2 = 160)
-            val powerSpectrum = FloatArray(nBins)
-            for (k in 0 until nBins) {
-                // In real FFT output, real and imaginary parts are interleaved:
-                val real = frame[2 * k]
-                val imag = frame[2 * k + 1]
-                powerSpectrum[k] = real * real + imag * imag
-            }
-            // Apply the Mel filterbank: for each filter, sum the weighted power
-            val melEnergies = FloatArray(numFilters)
-            for (m in 0 until numFilters) {
-                var sum = 0f
-                for (k in 0 until nBins) {
-                    sum += melFilterbank.filterbank[m][k] * powerSpectrum[k]
+            for (j in frame.indices) frame[j] *= hannWindow[j]
+
+            // FFT calculation
+            val fftData = frame.copyOf()
+            fft.realForward(fftData)
+
+            // Power spectrum with librosa's epsilon
+            val powerSpectrum = FloatArray(numBins).apply {
+                this[0] = fftData[0].pow(2) + 1e-10f
+                for (k in 1 until numBins) {
+                    val real = fftData[2*k - 1]
+                    val imag = fftData[2*k]
+                    this[k] = real.pow(2) + imag.pow(2) + 1e-10f
                 }
-                melEnergies[m] = sum
             }
-            // Save the raw mel energies for this frame
+
+            // Filter application
+            val melEnergies = FloatArray(nMels) { m ->
+                var sum = 0f
+                for (k in powerSpectrum.indices) {
+                    sum += powerSpectrum[k] * melFilterbank.filterbank[m][k]
+                }
+                sum
+            }
             melSpectrogram.add(melEnergies)
         }
-        // After processing all frames, apply global dB conversion and normalization
-        finalizeNormalization()
+        normalizeSpectrogram()
     }
 
-    /**
-     * Normalize the mel spectrogram as in Python:
-     *   - Compute the global maximum over all frames.
-     *   - For each value, compute: 10 * log10(value / globalMax + eps)
-     *   - Then normalize: (dB + 40) / 40
-     */
-    private fun finalizeNormalization() {
-        if (melSpectrogram.isEmpty()) return
-        var globalMax = 0f
-        for (frame in melSpectrogram) {
-            for (value in frame) {
-                if (value > globalMax) globalMax = value
+    private fun padArray(arr: FloatArray, pad: Int): FloatArray {
+        val padded = FloatArray(arr.size + 2 * pad).apply {
+            System.arraycopy(arr, 0, this, pad, arr.size)
+            for (i in 0 until pad) {
+                this[pad - 1 - i] = arr[i.coerceAtMost(arr.size - 1)]
+                this[pad + arr.size + i] = arr[(arr.size - 1 - i).coerceAtLeast(0)]
             }
         }
-        if (globalMax <= 0f) globalMax = 1e-8f
+        return padded
+    }
 
-        for (i in melSpectrogram.indices) {
-            for (j in 0 until numFilters) {
-                val ratio = (melSpectrogram[i][j] / globalMax).coerceAtLeast(1e-8f)
+    private fun normalizeSpectrogram() {
+        val globalMax = melSpectrogram.maxOf { it.maxOrNull() ?: 0f }
+        val eps = 1e-10f
+
+        melSpectrogram.forEachIndexed { i, frame ->
+            for (j in frame.indices) {
+                val ratio = (frame[j] / globalMax).coerceAtLeast(eps)
                 val dB = 10 * log10(ratio)
                 melSpectrogram[i][j] = (dB + 40) / 40
             }
         }
-    }
-
-    /**
-     * (Optional) Create a bitmap visualization of the spectrogram.
-     */
-    fun getSpectrogramBitmap(): Bitmap {
-        val width = numFilters
-        val height = melSpectrogram.size
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val pixels = IntArray(width * height)
-        var index = 0
-        for (i in 0 until height) {
-            for (j in 0 until width) {
-                val intensity = (melSpectrogram[i][j] * 255).toInt().coerceIn(0, 255)
-                pixels[index++] = Color.rgb(intensity, intensity, intensity)
-            }
-        }
-        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
-        return bitmap
     }
 }

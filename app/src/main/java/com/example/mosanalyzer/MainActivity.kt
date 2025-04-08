@@ -1,10 +1,13 @@
 package com.example.mosanalyzer
 
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import android.annotation.SuppressLint
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -17,21 +20,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
-import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
-import ai.onnxruntime.*
+import androidx.documentfile.provider.DocumentFile
+import android.util.Log
 import kotlinx.coroutines.*
 import java.io.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.*
+import java.util.Collections
+import kotlin.math.floor
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!Python.isStarted()) {
-            Python.start(AndroidPlatform(this))
-        }
         setContent { MOSAnalyzerApp() }
     }
 }
@@ -42,16 +43,37 @@ fun MOSAnalyzerApp() {
     val context = LocalContext.current
     var selectedFileName by remember { mutableStateOf("No file selected") }
     var mosScore by remember { mutableStateOf<Float?>(null) }
+    var folderResult by remember { mutableStateOf("No folder processed yet") }
     var isLoading by remember { mutableStateOf(false) }
 
+    // Launcher for a single audio file.
     val pickAudioFile = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let {
             isLoading = true
             selectedFileName = getFileNameFromUri(context, it)
             val filePath = getFilePathFromUri(context, it)
-            processMOS(context, filePath) { score ->
-                mosScore = score
-                isLoading = false
+            CoroutineScope(Dispatchers.IO).launch {
+                val score = processMOSFile(context, filePath)
+                withContext(Dispatchers.Main) {
+                    mosScore = score
+                    isLoading = false
+                }
+                // Delete the temporary file after processing.
+                File(filePath).delete()
+            }
+        }
+    }
+
+    // Launcher for selecting a folder.
+    val pickFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { folderUri: Uri? ->
+        folderUri?.let {
+            isLoading = true
+            CoroutineScope(Dispatchers.IO).launch {
+                val result = processFolderIncrementally(context, it)
+                withContext(Dispatchers.Main) {
+                    folderResult = result
+                    isLoading = false
+                }
             }
         }
     }
@@ -61,7 +83,10 @@ fun MOSAnalyzerApp() {
         topBar = { TopAppBar(title = { Text("MOS Analyzer") }) }
     ) { padding ->
         Column(
-            modifier = Modifier.padding(padding).fillMaxSize().padding(16.dp),
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .padding(16.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
@@ -70,97 +95,131 @@ fun MOSAnalyzerApp() {
                 Text("Select Audio File")
             }
             Spacer(modifier = Modifier.height(16.dp))
+            Text("Folder Processing Result:", modifier = Modifier.padding(8.dp))
+            Text(folderResult, modifier = Modifier.padding(8.dp))
+            Button(onClick = { pickFolder.launch(null) }) {
+                Text("Select Folder")
+            }
+            Spacer(modifier = Modifier.height(16.dp))
             Crossfade(targetState = isLoading) { loading ->
                 if (loading) {
                     CircularProgressIndicator()
                 } else {
-                    mosScore?.let { Text("MOS Score: $it", modifier = Modifier.padding(8.dp)) }
+                    mosScore?.let { Text("MOS Score for file: $it", modifier = Modifier.padding(8.dp)) }
                 }
             }
         }
     }
 }
 
-fun loadAudioFile(filePath: String): FloatArray {
-    val file = File(filePath)
-    val inputStream = FileInputStream(file)
-    val byteArray = inputStream.readBytes()
-    inputStream.close()
-
-    val shortArray = ShortArray(byteArray.size / 2)
-    ByteBuffer.wrap(byteArray).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortArray)
-
-    return shortArray.map { it / 32768.0f }.toFloatArray() // Normalize audio
-}
-
-fun processMOS(context: Context, filePath: String, callback: (Float?) -> Unit) {
-    CoroutineScope(Dispatchers.IO).launch {
-        // Load and normalize audio.
+/** Suspend function to process one audio file and return its MOS score */
+@SuppressLint("DefaultLocale")
+suspend fun processMOSFile(context: Context, filePath: String): Float? = withContext(Dispatchers.IO) {
+    try {
+        val samplingRate = 16000
+        val inputLength = 9.01
         val audioData = loadAudioFile(filePath)
-        val shortAudioData = audioData.map { (it * 32768).toInt().toShort() }.toShortArray()
-        val targetLengthSamples = (9.01 * 16000).toInt()
-        val paddedAudio = ensureFixedAudioLength(shortAudioData, targetLengthSamples)
-        // Drop the last 160 samples (mimicking the Python code: audio_seg[:-160])
-        val segment = paddedAudio.copyOfRange(0, paddedAudio.size - 160)
-
-        // Process the segment with the updated Spectrogram (using frameSize=320 and nMels=120)
-        val spectrogram = Spectrogram(fs = 16000, frameSize = 320, nMels = 120)
-        spectrogram.processSegment(segment)
-        // At this point, spectrogram.melSpectrogram is a List<FloatArray>
-        var melSpec = spectrogram.melSpectrogram.toTypedArray()  // shape: [T, 120]
-
-        // Ensure the spectrogram has exactly 900 frames.
-        val targetFrames = 900
-        if (melSpec.size < targetFrames) {
-            // If less, pad at the end by repeating the last frame.
-            val padded = Array(targetFrames) { FloatArray(120) }
-            for (i in melSpec.indices) {
-                padded[i] = melSpec[i]
-            }
-            for (i in melSpec.size until targetFrames) {
-                padded[i] = melSpec.last()
-            }
-            melSpec = padded
-        } else if (melSpec.size > targetFrames) {
-            // If more, truncate.
-            melSpec = melSpec.take(targetFrames).toTypedArray()
+        val lenSamples = (inputLength * samplingRate).roundToInt()
+        var audio = audioData.copyOf()
+        while (audio.size < lenSamples) {
+            audio += audio
         }
-
+        val numHops = (floor(audio.size.toDouble() / samplingRate) - inputLength).toInt() + 1
+        val allMelSpecs = mutableListOf<Array<FloatArray>>()
+        for (idx in 0 until numHops) {
+            val start = (idx * samplingRate).toInt()
+            val end = ((idx + inputLength) * samplingRate).toInt()
+            if (end > audio.size) continue
+            val audioSeg = audio.sliceArray(start until end)
+            if (audioSeg.size < lenSamples) continue
+            // Remove last 160 samples (audio_seg[:-160])
+            val segment = audioSeg.copyOfRange(0, audioSeg.size - 160)
+            val spectrogram = Spectrogram(fs = 16000, frameSize = 320, nMels = 120)
+            spectrogram.processSegment(segment)
+            val melSpec = spectrogram.melSpectrogram.toTypedArray()
+            allMelSpecs.add(melSpec)
+        }
         val mosCalculator = ComputeMOS(context)
-        // The ONNX model expects an input of shape [batch, 900, 120]. Wrap in a List for batch size 1.
-        val score = mosCalculator.predictMOS(listOf(melSpec))
-        withContext(Dispatchers.Main) { callback(score) }
+        mosCalculator.predictMOS(allMelSpecs)
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
     }
 }
 
+/** Suspend function to process every audio file in the given folder incrementally.
+ * It processes each file, writes its MOS result immediately to a result file, and then releases resources.
+ */
+suspend fun processFolderIncrementally(context: Context, folderUri: Uri): String = withContext(Dispatchers.IO) {
+    val outputFile = File(context.filesDir, "mos_results.txt")
+    val writer = BufferedWriter(FileWriter(outputFile, false))
+    val pickedDir = DocumentFile.fromTreeUri(context, folderUri)
+    var processedCount = 0
 
-fun ensureFixedAudioLength(audio: ShortArray, targetLength: Int): ShortArray {
-    return if (audio.size < targetLength) {
-        // Pad with repeated data
-        val repeatedAudio = ShortArray(targetLength)
-        for (i in repeatedAudio.indices) {
-            repeatedAudio[i] = audio[i % audio.size]
+    if (pickedDir != null && pickedDir.isDirectory) {
+        val allFiles = pickedDir.listFiles().filter {
+            it.isFile && (it.type?.startsWith("audio/") == true)
         }
-        repeatedAudio
-    } else {
-        // Trim to required length
-        audio.copyOfRange(0, targetLength)
+
+        val batches = allFiles.chunked(200)
+        for ((batchIndex, batch) in batches.withIndex()) {
+            Log.d("FolderMOS", "Processing batch ${batchIndex + 1}/${batches.size}")
+
+            // New instance per batch
+            val mosCalculator = ComputeMOS(context)
+
+            for (file in batch) {
+                val fileName = file.name ?: "Unknown"
+                try {
+                    val filePath = getFilePathFromUri(context, file.uri)
+                    val score = processMOSFileWithInstance(context, filePath, mosCalculator)
+                    writer.write("$fileName : ${score ?: "Error"}\n")
+                    writer.flush()
+                    processedCount++
+                    File(filePath).delete()
+                } catch (ex: Exception) {
+                    ex.printStackTrace()
+                    writer.write("$fileName : Exception\n")
+                    writer.flush()
+                }
+                yield() // avoid blocking
+            }
+
+            // Clean up
+            mosCalculator.close() // Close ONNX resources
+            System.gc() // Suggest GC to clean up aggressively
+            delay(100)  // slight delay to let the system breathe
+        }
+    }
+
+    writer.close()
+    "Processed $processedCount files. Results saved to: ${outputFile.absolutePath}"
+}
+
+/** Write a given text to a file in internal storage */
+fun writeResultsToFile(context: Context, content: String, filename: String) {
+    try {
+        val file = File(context.filesDir, filename)
+        file.writeText(content)
+        Log.d("FolderMOS", "Saved results to: ${file.absolutePath}")
+    } catch (e: Exception) {
+        Log.e("FolderMOS", "Error writing file", e)
     }
 }
 
-
-
-
+/** Returns the file path for the Uri by copying its content into a temporary file */
 fun getFilePathFromUri(context: Context, uri: Uri): String {
     val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
-    val file = File(context.cacheDir, "temp_audio.wav")
-    val outputStream = FileOutputStream(file)
-    inputStream?.copyTo(outputStream)
+    // Create a temporary file with a unique name.
+    val tempFile = File(context.cacheDir, "temp_audio_${System.currentTimeMillis()}.wav")
+    FileOutputStream(tempFile).use { outputStream ->
+        inputStream?.copyTo(outputStream)
+    }
     inputStream?.close()
-    outputStream.close()
-    return file.absolutePath
+    return tempFile.absolutePath
 }
 
+/** Returns the display name of the file from its Uri */
 fun getFileNameFromUri(context: Context, uri: Uri): String {
     val cursor = context.contentResolver.query(uri, null, null, null, null)
     val nameIndex = cursor?.getColumnIndex(OpenableColumns.DISPLAY_NAME)
@@ -170,32 +229,60 @@ fun getFileNameFromUri(context: Context, uri: Uri): String {
     return fileName ?: "Unknown"
 }
 
-//fun computeMelSpectrogram(audio: ShortArray, nMels: Int): Array<FloatArray> {
-//    val spectrogram = Spectrogram(fs = 16000, fftSize = 640, melFilterbankSize = nMels)
-//    spectrogram.processAudio(audio)
-//
-//    // Convert spectrogram data to Mel spectrogram format
-//    val melSpectrograms = mutableListOf<FloatArray>()
-//
-//    for (frame in spectrogram.mSpectrogram) {
-//        melSpectrograms.add(frame.copyOf(nMels)) // Ensure we only take `nMels` features
-//    }
-//
-//    // Ensure exactly 900 frames (truncate or pad)
-//    return if (melSpectrograms.size >= 900) {
-//        melSpectrograms.take(900).toTypedArray()
-//    } else {
-//        val paddedMelSpectrograms = Array(900) { FloatArray(nMels) }
-//        for (i in melSpectrograms.indices) {
-//            paddedMelSpectrograms[i] = melSpectrograms[i]
-//        }
-//        paddedMelSpectrograms
-//    }
-//}
-//
+/** Loads a WAV file from the given file path and converts it to normalized FloatArray */
+fun loadAudioFile(filePath: String): FloatArray {
+    val file = File(filePath)
+    val inputStream = FileInputStream(file)
+    val byteArray = inputStream.readBytes()
+    inputStream.close()
+    val headerSize = 44  // Standard WAV header size
+    val audioBytes = byteArray.copyOfRange(headerSize, byteArray.size)
+    val shortArray = ShortArray(audioBytes.size / 2)
+    ByteBuffer.wrap(audioBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortArray)
+    return shortArray.map { it / Short.MAX_VALUE.toFloat() }.toFloatArray()
+}
 
+/** (Assuming your Spectrogram, ComputeMOS, etc. remain unchanged) */
+@SuppressLint("DefaultLocale")
+fun processMOS(context: Context, filePath: String, callback: (Float?) -> Unit) {
+    CoroutineScope(Dispatchers.IO).launch {
+        val score = processMOSFile(context, filePath)
+        callback(score)
+    }
+}
 
-class ComputeMOS(context: Context) {
+suspend fun processMOSFileWithInstance(context: Context, filePath: String, mosCalculator: ComputeMOS): Float? = withContext(Dispatchers.IO) {
+    try {
+        val samplingRate = 16000
+        val inputLength = 9.01
+        val audioData = loadAudioFile(filePath)
+        val lenSamples = (inputLength * samplingRate).roundToInt()
+        var audio = audioData.copyOf()
+        while (audio.size < lenSamples) {
+            audio += audio
+        }
+        val numHops = (floor(audio.size.toDouble() / samplingRate) - inputLength).toInt() + 1
+        val allMelSpecs = mutableListOf<Array<FloatArray>>()
+        for (idx in 0 until numHops) {
+            val start = (idx * samplingRate).toInt()
+            val end = ((idx + inputLength) * samplingRate).toInt()
+            if (end > audio.size) continue
+            val audioSeg = audio.sliceArray(start until end)
+            if (audioSeg.size < lenSamples) continue
+            val segment = audioSeg.copyOfRange(0, audioSeg.size - 160)
+            val spectrogram = Spectrogram(fs = 16000, frameSize = 320, nMels = 120)
+            spectrogram.processSegment(segment)
+            val melSpec = spectrogram.melSpectrogram.toTypedArray()
+            allMelSpecs.add(melSpec)
+        }
+        mosCalculator.predictMOS(allMelSpecs)
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
+
+class ComputeMOS(context: Context) : Closeable {
     private val ortEnv = OrtEnvironment.getEnvironment()
     private val session: OrtSession
 
@@ -210,7 +297,11 @@ class ComputeMOS(context: Context) {
     private fun copyModelToInternalStorage(context: Context, fileName: String): File {
         val modelFile = File(context.filesDir, fileName)
         if (!modelFile.exists()) {
-            context.assets.open(fileName).use { input -> modelFile.outputStream().use { output -> input.copyTo(output) } }
+            context.assets.open(fileName).use { input ->
+                modelFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
         }
         return modelFile
     }
@@ -218,13 +309,19 @@ class ComputeMOS(context: Context) {
     fun predictMOS(melSpectrograms: List<Array<FloatArray>>?): Float? {
         return try {
             melSpectrograms?.mapNotNull { melSpec ->
-                val inputTensor = OnnxTensor.createTensor(ortEnv, arrayOf(melSpec))
-                val output = session.run(Collections.singletonMap("input_1", inputTensor))
-                (output[0].value as Array<FloatArray>)[0][0]
+                OnnxTensor.createTensor(ortEnv, arrayOf(melSpec)).use { inputTensor ->
+                    val output = session.run(Collections.singletonMap("input_1", inputTensor))
+                    (output[0].value as Array<FloatArray>)[0][0]
+                }
             }?.average()?.toFloat()
         } catch (e: Exception) {
             e.printStackTrace()
             null
         }
+    }
+
+    override fun close() {
+        session.close()
+        // ortEnv.close()  <- don't close this unless you're done with everything
     }
 }

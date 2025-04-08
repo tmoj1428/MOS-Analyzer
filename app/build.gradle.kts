@@ -74,6 +74,7 @@ dependencies {
 //    implementation(libs.chaquo)
     implementation(libs.jTransforms)
     implementation(libs.onnxruntime)
+    implementation(libs.androidx.documentfile)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

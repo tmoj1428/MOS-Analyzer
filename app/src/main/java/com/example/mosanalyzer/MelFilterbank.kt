@@ -4,50 +4,41 @@ import kotlin.math.floor
 import kotlin.math.log10
 import kotlin.math.pow
 
+/** Mel Filterbank with normalization (mimicking librosa.filters.mel with norm="slaney") */
 class MelFilterbank(
     private val fs: Float,
-    private val frameSize: Int = 320,   // frameSize from Spectrogram (used to compute n_fft below)
-    private val numFilters: Int = 120   // n_mels from Python
+    private val frameSize: Int = 320,
+    private val numFilters: Int = 120
 ) {
-    // In librosa, n_fft = frameSize + 1
-    private val nFftPlus = frameSize + 1    // e.g., 321
-    private val nyquistFs = fs / 2
-
-    // We will build filters for bins [0, nFftPlus/2)
-    // nFftPlus/2 is 321/2 = 160 (integer division)
-    val filterbank = Array(numFilters) { FloatArray(nFftPlus / 2) }
+    private val nFft = frameSize + 1
+    private val numBins = (nFft + 1) / 2
+    val filterbank = Array(numFilters) { FloatArray(numBins) }
 
     init {
-        // Compute mel points (numFilters+2 points) between 0 and freqToMel(nyquist)
-        val melMin = 0f
-        val melMax = freqToMel(nyquistFs)
-        val melPoints = FloatArray(numFilters + 2)
-        val hzPoints = FloatArray(numFilters + 2)
-        val deltaMel = (melMax - melMin) / (numFilters + 1)
-        for (m in 0 until numFilters + 2) {
-            melPoints[m] = melMin + deltaMel * m
-            hzPoints[m] = melToFreq(melPoints[m])
-        }
-        // Compute FFT bin indices using librosa’s formula: floor((n_fft+1) * hz / sr)
-        val binPoints = IntArray(numFilters + 2) { i ->
-            floor((nFftPlus * hzPoints[i] / fs).toDouble()).toInt()
-        }
-        // Build triangular filters
-        for (m in 1 until numFilters + 1) {
-            val binMin = binPoints[m - 1]
-            val binCenter = binPoints[m]
-            val binMax = binPoints[m + 1]
-            // Rising slope
-            for (k in binMin until binCenter) {
-                filterbank[m - 1][k] = (k - binMin).toFloat() / (binCenter - binMin)
+        val melMax = freqToMel(fs / 2)
+        val hzPoints = (0..numFilters + 1).map {
+            melToFreq(it * melMax / (numFilters + 1))
+        }.toFloatArray()
+
+        val binPoints = hzPoints.map { hz ->
+            floor((nFft * hz / fs).toDouble()).toInt()
+        }.toIntArray()
+
+        for (m in 1..numFilters) {
+            val left = binPoints[m-1]
+            val center = binPoints[m]
+            val right = binPoints[m+1]
+            val scale = 2.0f / (right - left)
+
+            for (k in left until center) {
+                filterbank[m-1][k] = (k - left).toFloat() / (center - left) * scale
             }
-            // Falling slope
-            for (k in binCenter until binMax) {
-                filterbank[m - 1][k] = (binMax - k).toFloat() / (binMax - binCenter)
+            for (k in center until right) {
+                filterbank[m-1][k] = (right - k).toFloat() / (right - center) * scale
             }
         }
     }
 
-    private fun freqToMel(hz: Float): Float = 2595f * log10(1 + hz / 700)
-    private fun melToFreq(mel: Float): Float = 700f * (10.0.pow((mel / 2595).toDouble()) - 1).toFloat()
+    private fun freqToMel(hz: Float) = 2595f * log10(1 + hz/700f)
+    private fun melToFreq(mel: Float) = 700f * (10.0.pow(mel/2595.0) - 1).toFloat()
 }
